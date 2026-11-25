@@ -114,6 +114,7 @@ mod wave;
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
@@ -173,6 +174,29 @@ pub const VIEW_SLOTS: u32 = 2_294_784;
 /// Those before the views of memory by address, which programs without
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
+
+/// The highest heap index translated shaders read a view at, set by the
+/// host (`0`: not set).
+static VIEW_INDEX_LIMIT: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the highest heap index translated shaders read a view at: the
+/// last slot before the views of memory by address, on a host whose view
+/// heaps hold fewer than [`VIEW_SLOTS`] (NVIDIA takes 1,000,000). Read past
+/// the heap, a view index stops the host GPU or reads what is not a view.
+/// Set before the first shader is translated; the shader cache keys
+/// entries by it.
+pub fn set_view_index_limit(last: u32) {
+    VIEW_INDEX_LIMIT.store(last.min(OWN_SLOTS - 1), Ordering::Relaxed);
+}
+
+/// The highest heap index translated shaders read a view at:
+/// [`set_view_index_limit`]'s, else the last of [`OWN_SLOTS`].
+pub fn view_index_limit() -> u32 {
+    match VIEW_INDEX_LIMIT.load(Ordering::Relaxed) {
+        0 => OWN_SLOTS - 1,
+        last => last,
+    }
+}
 
 
 /// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs

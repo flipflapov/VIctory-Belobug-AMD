@@ -79,6 +79,14 @@ Memory the title shows at several addresses:
   vehicles were left behind; the distant trees' quads that crossed the
   screen have not come back since either (cause not proven).
 
+NVIDIA (started; the world is still black on an RTX 3060):
+- View heaps are capped at about 1,000,000 views there, fewer than the
+  title's 1,245,184. Shaders now read view indices only up to the end of
+  the heap the host made, not up to the padded size AMD takes; the lost
+  title slots are counted in the log. See
+  [docs/view-heap-limit.md](docs/view-heap-limit.md)
+  (`VICTORY_CAPPED_DYNAMIC_SLOTS`).
+
 AMD:
 - Shaders that crash or never leave the AMD driver's compiler cost only
   their pipeline, not the run.

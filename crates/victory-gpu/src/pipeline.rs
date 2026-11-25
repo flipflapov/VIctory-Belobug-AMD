@@ -263,6 +263,9 @@ fn dump(shader: &Shader) {
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage, RootType};
     let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    // The last view index shaders read, on a host whose view heaps are
+    // shorter than the console's, before the first is translated.
+    crate::descriptor::host::view_heap_cap();
     let host = crate::shader_cache::host_shader(container, target)?;
     let dxil_heap = Container::parse(&host.dxil).is_ok_and(|c| {
         c.part(FourCC::SFI0)

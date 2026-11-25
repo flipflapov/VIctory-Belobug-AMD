@@ -527,6 +527,117 @@ fn view_slots(count: u32) -> u32 {
     if cfg!(test) { slots } else { slots.max(victory_shader::emit::VIEW_SLOTS) }
 }
 
+/// The largest shader-visible view heap the host makes, if it makes none
+/// of [`victory_shader::emit::VIEW_SLOTS`] (`None`: it does, as AMD's do).
+/// NVIDIA's take 1,000,000 or so, fewer than the title's 1,245,184 slots
+/// alone. Asked once, before the first shader is translated (`pipeline`)
+/// and before a view heap is made: the title makes pipelines before its
+/// heap, and shaders keep the last view index they were translated with,
+/// which is then the last slot of a capped heap's own
+/// ([`victory_shader::emit::set_view_index_limit`]). Without it, shaders
+/// read views up to [`victory_shader::emit::OWN_SLOTS`], past the end of
+/// such a heap.
+/// (The idea of probing the host's view heap before the first shader is
+/// DexNom's and victory-world-runtime's `probe_view_limit`, written anew.)
+pub(crate) fn view_heap_cap() -> Option<u32> {
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        if cfg!(test) {
+            return None;
+        }
+        let host = host()?;
+        let fits = |count: u32| {
+            // SAFETY: plain heap creation; the heap is released at once.
+            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: count,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+            };
+            made.is_ok()
+        };
+        if fits(victory_shader::emit::VIEW_SLOTS) {
+            return None;
+        }
+        // 2^20 where the driver takes it (resource binding tier 3 leaves
+        // the limit to the hardware), else the D3D12 minimum.
+        let size = [1 << 20, PORTABLE_VIEWS]
+            .into_iter()
+            .find(|&n| fits(n))
+            .unwrap_or(PORTABLE_VIEWS);
+        let dynamic = dynamic_capped(size);
+        let last = size - crate::memory::SLOTS - 1;
+        victory_shader::emit::set_view_index_limit(last);
+        tracing::warn!(
+            size,
+            title_slots = size - dynamic - crate::memory::SLOTS,
+            dynamic,
+            last_view_index = last,
+            "host view heaps are capped: shaders read views up to the heap's end"
+        );
+        Some(size)
+    })
+}
+
+/// Diagnostic (a capped view heap, NVIDIA): the title slots past the host
+/// heap the title writes and draws bind, each counted once. Logged as the
+/// counts reach powers of two: how many slots a remap of the title's index
+/// space would have to find room for.
+fn lost_slot(index: u32, kept: u32, for_draw: bool) {
+    #[derive(Default)]
+    struct Lost {
+        written: Vec<u64>,
+        drawn: Vec<u64>,
+        counts: [u32; 2],
+        highest: u32,
+    }
+    static LOST: Mutex<Option<Lost>> = Mutex::new(None);
+    let mut lost = LOST.lock().unwrap_or_else(|e| e.into_inner());
+    let lost = lost.get_or_insert_with(Lost::default);
+    let at = (index - kept) as usize;
+    let (word, bit) = (at / 64, 1u64 << (at % 64));
+    let kind = usize::from(for_draw);
+    let set = if for_draw {
+        &mut lost.drawn
+    } else {
+        &mut lost.written
+    };
+    if set.len() <= word {
+        set.resize(word + 1, 0);
+    }
+    if set[word] & bit != 0 {
+        return;
+    }
+    set[word] |= bit;
+    lost.counts[kind] += 1;
+    lost.highest = lost.highest.max(index);
+    if lost.counts[kind].is_power_of_two() {
+        tracing::warn!(
+            written = lost.counts[0],
+            drawn = lost.counts[1],
+            highest = lost.highest,
+            kept,
+            "title view slots past the host heap (each counted once): written by the title, bound by draws"
+        );
+    }
+}
+
+/// Dynamic slots of a view heap capped at `size`: [`DYNAMIC_CAPPED`], or
+/// `VICTORY_CAPPED_DYNAMIC_SLOTS` (tables made afresh per draw against
+/// title slots kept; more of one is fewer of the other).
+fn dynamic_capped(size: u32) -> u32 {
+    static SET: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("VICTORY_CAPPED_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    });
+    set.unwrap_or(DYNAMIC_CAPPED).clamp(1 << 12, size / 2)
+}
+
 /// Dynamic slots of a sampler heap capped at [`SAMPLERS`], for tables
 /// reaching past the title slots it keeps.
 const SAMPLER_DYNAMIC: u32 = 256;
@@ -580,23 +691,32 @@ impl HostHeap {
         }
         let extra = if sampler { 0 } else { DYNAMIC };
         let wanted = count;
+        // A capped host's size, known before the heap is made (and the
+        // view index shaders stop at with it).
+        let capped = if sampler {
+            PORTABLE_VIEWS
+        } else {
+            view_heap_cap().unwrap_or(PORTABLE_VIEWS)
+        };
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
-            Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
+            Err(e) if !sampler && count + extra + crate::memory::SLOTS > capped => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
+                // The title's own and the dynamic slots end where
+                // `view_heap_cap` told shaders their views end.
+                let dynamic = dynamic_capped(capped);
+                let kept = capped - dynamic - crate::memory::SLOTS;
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
-                    "host view heap capped at {PORTABLE_VIEWS}"
+                    size = capped,
+                    kept,
+                    dynamic,
+                    lost = wanted.saturating_sub(kept),
+                    "host view heap capped at {capped}: title slots past those kept are left out"
                 );
-                (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
-                )
+                (make(capped - crate::memory::SLOTS).ok()?, kept, dynamic)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -1044,16 +1164,8 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, Ordering::Relaxed) < index {
-                tracing::warn!(
-                    index,
-                    count = self.count,
-                    for_draw,
-                    "title slot past the host heap"
-                );
+            if !self.sampler {
+                lost_slot(index, self.count, for_draw);
             }
             return None;
         }

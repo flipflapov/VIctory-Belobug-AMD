@@ -81,3 +81,25 @@ tier-2 NVIDIA host to be seen live; it is a static change on this machine.
 2. Remap root tables past the cap (#21, landed).
 3. Decide what to do with directly indexed heaps past the cap.
 4. Handle the sampler heap's 2,048 limit without losing the heap.
+
+## This fork: indices kept inside a capped heap
+
+Measured on an RTX 3060 12 GB (Windows 11): the title asked for 1,245,184
+views, the host made 1,000,000, and translated shaders still read view
+indices up to `OWN_SLOTS` (2,293,759), sized for the padded heaps AMD
+makes. An index past the end of the host heap is undefined; on NVIDIA it
+has hung the card (DexNom's and victory-world-runtime's notes).
+
+`descriptor::host::view_heap_cap` now asks the host, before the first
+shader is translated, whether it makes a view heap of `VIEW_SLOTS`. If not,
+it takes the largest of 2^20 and 1,000,000 that it does make, and tells the
+translator (`victory_shader::emit::set_view_index_limit`) that view indices
+end at the last slot before the views of memory by address. The shader
+cache keys entries by that index on such a host only, so AMD entries stay
+valid. `VICTORY_CAPPED_DYNAMIC_SLOTS` trades title slots for per-draw
+tables (2^16 by default; one run ran out of them once).
+
+Title slots past the heap still read whatever the heap holds at that
+index (dynamic slots), or the last slot. A warning counts the lost slots
+the title writes and the ones draws bind, each once, at powers of two: if
+they are many, step 3 needs the compacting option above.

@@ -403,9 +403,10 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
-        // An index past the heap is a fault that stops the host GPU.
+        // An index past the heap is a fault that stops the host GPU: the
+        // host's heaps may be shorter than the console's (NVIDIA).
         let index = if !sampler && super::limits_indices() {
-            let last = self.m.i32(super::OWN_SLOTS - 1);
+            let last = self.m.i32(super::view_index_limit());
             let i32t = self.t.i32;
             self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
         } else {

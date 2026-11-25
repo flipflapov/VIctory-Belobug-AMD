@@ -100,12 +100,18 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
     }
 }
 
-/// The part of an entry's key before the container: the build, and the
-/// host's wave sizes (a translation for one host's waves is not another's).
+/// The part of an entry's key before the container: the build, the
+/// host's wave sizes (a translation for one host's waves is not another's)
+/// and, on a host whose view heaps are shorter than the console's, the last
+/// view index shaders read (left out otherwise, so earlier entries stay).
 fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
+    let views = victory_shader::emit::view_index_limit();
+    if views != victory_shader::emit::OWN_SLOTS - 1 {
+        h.update(&views.to_le_bytes());
+    }
     *h.finalize().as_bytes()
 }
 
